@@ -688,6 +688,21 @@ AMD64Instr* AMD64Instr_Call ( AMD64CondCode cond, Addr64 target, Int regparms,
    vassert(is_sane_RetLoc(rloc));
    return i;
 }
+AMD64Instr* AMD64Instr_Jmp ( UInt hereOffs, UInt dstOffs ) {
+   AMD64Instr* i       = LibVEX_Alloc_inline(sizeof(AMD64Instr));
+   i->tag              = Ain_Jmp;
+   i->Ain.Jmp.hereOffs = hereOffs;
+   i->Ain.Jmp.dstOffs  = dstOffs;
+   return i;
+}
+AMD64Instr* AMD64Instr_JmpCond ( AMD64CondCode cond,
+                                 UInt dst_qentno /* FOR DEBUG PRINTING ONLY */ ) {
+   AMD64Instr* i             = LibVEX_Alloc_inline(sizeof(AMD64Instr));
+   i->tag                    = Ain_JmpCond;
+   i->Ain.JmpCond.cond       = cond;
+   i->Ain.JmpCond.dst_qentno = dst_qentno;
+   return i;
+}
 
 AMD64Instr* AMD64Instr_XDirect ( Addr64 dstGA, AMD64AMode* amRIP,
                                  AMD64CondCode cond, Bool toFastEP ) {
@@ -1036,6 +1051,13 @@ AMD64Instr* AMD64Instr_ProfInc ( void ) {
    i->tag        = Ain_ProfInc;
    return i;
 }
+AMD64Instr* AMD64Instr_IfThenElse(HInstrIfThenElse* hite)
+{
+   AMD64Instr* i          = LibVEX_Alloc_inline(sizeof(AMD64Instr));
+   i->tag                 = Ain_IfThenElse;
+   i->Ain.IfThenElse.hite = hite;
+   return i;
+}
 
 void ppAMD64Instr ( const AMD64Instr* i, Bool mode64 ) 
 {
@@ -1107,6 +1129,16 @@ void ppAMD64Instr ( const AMD64Instr* i, Bool mode64 )
          ppRetLoc(i->Ain.Call.rloc);
          vex_printf("] 0x%llx", i->Ain.Call.target);
          break;
+      case Ain_Jmp:
+         vex_printf("jmp from [%03u] to [%03u] (delta = %d)",
+                    i->Ain.Jmp.hereOffs, i->Ain.Jmp.dstOffs,
+                    (Int)(i->Ain.Jmp.dstOffs) - (Int)(i->Ain.Jmp.hereOffs));
+         return;
+      case Ain_JmpCond:
+         vex_printf("j%s to queue[%u] (delta currently unknown)",
+                    showAMD64CondCode(i->Ain.JmpCond.cond),
+                    i->Ain.JmpCond.dst_qentno);
+         return;
 
       case Ain_XDirect:
          vex_printf("(xDirect) ");
@@ -1386,9 +1418,18 @@ void ppAMD64Instr ( const AMD64Instr* i, Bool mode64 )
       case Ain_ProfInc:
          vex_printf("(profInc) movabsq $NotKnownYet, %%r11; incq (%%r11)");
          return;
+      case Ain_IfThenElse:
+         vex_printf("if (ccOOL=%s) then IL {...",
+                    showAMD64CondCode(i->Ain.IfThenElse.hite->ccOOL));
+         return;
       default:
          vpanic("ppAMD64Instr");
    }
+}
+
+void ppAMD64CondCode(AMD64CondCode condCode)
+{
+   vex_printf("%s", showAMD64CondCode(condCode));
 }
 
 /* --------- Helpers for register allocation. --------- */
@@ -1928,6 +1969,14 @@ void mapRegs_AMD64Instr ( HRegRemap* m, AMD64Instr* i, Bool mode64 )
    }
 }
 
+extern HInstrIfThenElse* isIfThenElse_AMD64Instr(AMD64Instr* i)
+{
+   if (UNLIKELY(i->tag == Ain_IfThenElse)) {
+      return i->Ain.IfThenElse.hite;
+   }
+   return NULL;
+}
+
 /* Generate amd64 spill/reload instructions under the direction of the
    register allocator.  Note it's critical these don't write the
    condition codes. */
@@ -2438,13 +2487,9 @@ static UChar* do_ffree_st ( UChar* p, Int n )
    instruction was a profiler inc, set *is_profInc to True, else
    leave it unchanged. */
 
-Int emit_AMD64Instr ( /*MB_MOD*/Bool* is_profInc,
-                      UChar* buf, Int nbuf, const AMD64Instr* i, 
-                      Bool mode64, VexEndness endness_host,
-                      const void* disp_cp_chain_me_to_slowEP,
-                      const void* disp_cp_chain_me_to_fastEP,
-                      const void* disp_cp_xindir,
-                      const void* disp_cp_xassisted )
+UInt emit_AMD64Instr ( /*MB_MOD*/Bool* is_profInc,
+                       UChar* buf, UInt nbuf, const AMD64Instr* i,
+                       const EmitConstants* emitConsts )
 {
    UInt /*irno,*/ opc, opc_rr, subopc_imm, opc_imma, opc_cl, opc_imm, subopc;
    UInt   xtra;
@@ -2454,7 +2499,7 @@ Int emit_AMD64Instr ( /*MB_MOD*/Bool* is_profInc,
    UChar* ptmp;
    Int    j;
    vassert(nbuf >= 64);
-   vassert(mode64 == True);
+   vassert(emitConsts->mode64 == True);
 
    /* vex_printf("asm  "); ppAMD64Instr(i, mode64); vex_printf("\n"); */
 
@@ -2994,14 +3039,56 @@ Int emit_AMD64Instr ( /*MB_MOD*/Bool* is_profInc,
       goto done;
    }
 
+   case Ain_Jmp: {
+      Long deltaLL
+         = ((Long)(i->Ain.Jmp.dstOffs)) - ((Long)(i->Ain.Jmp.hereOffs));
+      /* Stay sane .. */
+      vassert(-1000000LL <= deltaLL && deltaLL <= 1000000LL);
+      Int delta = (Int)deltaLL;
+      /* The offset that we must encode is actually relative to the start of
+         the next instruction.  Also, there are short and long encodings of
+         this instruction.  Try to use the short one if possible. */
+      if (delta >= -0x78 && delta <= 0x78) {
+         delta -= 2;
+         *p++ = toUChar(0xEB); // jump short
+         *p++ = toUChar(delta & 0xFF);
+         delta >>= 8;
+         vassert(delta == 0 || delta == -1);
+      } else {
+         delta -= 5;
+         *p++ = toUChar(0xE9); // jump near
+         p = emit32(p, (UInt)delta);
+      }
+      goto done;
+   }
+
+   case Ain_JmpCond: {
+      /* We don't know the destination yet, so just emit this so that it
+         loops back to itself.  The main (host-independent) assembler logic
+         will later patch it when the destination is known.  Until then,
+         emitting an instruction that jumps to itself seems like a good
+         idea, since if we mistakenly forget to patch it, the generated code
+         will spin at this point, and when we attach a debugger, it will be
+         obvious what has happened. */
+      *p++ = toUChar(0x0F);
+      *p++ = toUChar(0x80 + (UInt)i->Ain.JmpCond.cond);
+      // FFFFFFFA == -6, which, relative to the next insn, points to
+      // the start of this one.
+      *p++ = toUChar(0xFA);
+      *p++ = toUChar(0xFF);
+      *p++ = toUChar(0xFF);
+      *p++ = toUChar(0xFF);
+      goto done;
+   }
+
    case Ain_XDirect: {
       /* NB: what goes on here has to be very closely coordinated with the
          chainXDirect_AMD64 and unchainXDirect_AMD64 below. */
       /* We're generating chain-me requests here, so we need to be
          sure this is actually allowed -- no-redir translations can't
          use chain-me's.  Hence: */
-      vassert(disp_cp_chain_me_to_slowEP != NULL);
-      vassert(disp_cp_chain_me_to_fastEP != NULL);
+      vassert(emitConsts->disp_cp_chain_me_to_slowEP != NULL);
+      vassert(emitConsts->disp_cp_chain_me_to_fastEP != NULL);
 
       HReg r11 = hregAMD64_R11();
 
@@ -3046,8 +3133,8 @@ Int emit_AMD64Instr ( /*MB_MOD*/Bool* is_profInc,
       *p++ = 0x49;
       *p++ = 0xBB;
       const void* disp_cp_chain_me
-               = i->Ain.XDirect.toFastEP ? disp_cp_chain_me_to_fastEP 
-                                         : disp_cp_chain_me_to_slowEP;
+               = i->Ain.XDirect.toFastEP ? emitConsts->disp_cp_chain_me_to_fastEP 
+                                         : emitConsts->disp_cp_chain_me_to_slowEP;
       p = emit64(p, (Addr)disp_cp_chain_me);
       /* call *%r11 */
       *p++ = 0x41;
@@ -3071,7 +3158,7 @@ Int emit_AMD64Instr ( /*MB_MOD*/Bool* is_profInc,
          translations without going through the scheduler.  That means
          no XDirects or XIndirs out from no-redir translations.
          Hence: */
-      vassert(disp_cp_xindir != NULL);
+      vassert(emitConsts->disp_cp_xindir != NULL);
 
       /* Use ptmp for backpatching conditional jumps. */
       ptmp = NULL;
@@ -3091,18 +3178,18 @@ Int emit_AMD64Instr ( /*MB_MOD*/Bool* is_profInc,
       p = doAMode_M(p, i->Ain.XIndir.dstGA, i->Ain.XIndir.amRIP);
 
       /* get $disp_cp_xindir into %r11 */
-      if (fitsIn32Bits((Addr)disp_cp_xindir)) {
+      if (fitsIn32Bits((Addr)emitConsts->disp_cp_xindir)) {
          /* use a shorter encoding */
          /* movl sign-extend(disp_cp_xindir), %r11 */
          *p++ = 0x49;
          *p++ = 0xC7;
          *p++ = 0xC3;
-         p = emit32(p, (UInt)(Addr)disp_cp_xindir);
+         p = emit32(p, (UInt)(Addr)emitConsts->disp_cp_xindir);
       } else {
          /* movabsq $disp_cp_xindir, %r11 */
          *p++ = 0x49;
          *p++ = 0xBB;
-         p = emit64(p, (Addr)disp_cp_xindir);
+         p = emit64(p, (Addr)emitConsts->disp_cp_xindir);
       }
 
       /* jmp *%r11 */
@@ -3168,7 +3255,7 @@ Int emit_AMD64Instr ( /*MB_MOD*/Bool* is_profInc,
       /* movabsq $disp_assisted, %r11 */
       *p++ = 0x49;
       *p++ = 0xBB;
-      p = emit64(p, (Addr)disp_cp_xassisted);
+      p = emit64(p, (Addr)emitConsts->disp_cp_xassisted);
       /* jmp *%r11 */
       *p++ = 0x41;
       *p++ = 0xFF;
@@ -3915,7 +4002,7 @@ Int emit_AMD64Instr ( /*MB_MOD*/Bool* is_profInc,
    }
 
   bad:
-   ppAMD64Instr(i, mode64);
+   ppAMD64Instr(i, emitConsts->mode64);
    vpanic("emit_AMD64Instr");
    /*NOTREACHED*/
    
@@ -4121,6 +4208,45 @@ VexInvalRange patchProfInc_AMD64 ( VexEndness endness_host,
    p[9] = imm64 & 0xFF; imm64 >>= 8;
    VexInvalRange vir = { (HWord)place_to_patch, 13 };
    return vir;
+}
+
+
+/* Create relocation info needed to patch a branch offset for instruction I
+   whose first instruction is at WHERE in the assembly buffer. */
+Relocation createRelocInfo_AMD64 ( AssemblyBufferOffset where,
+                                   const AMD64Instr* i )
+{
+   /* Ain_JmpCond produces a conditional branch (near), of the form
+         0F 8x <32-bit-offset>
+      where 'x' encodes the condition code.
+
+      When we come to patch it so as to jump to a particular destination, we
+      must be aware that:
+
+      (1) the field we want to patch starts 2 bytes into the instruction.
+          Hence ".where = where + 2"
+
+      (2) the processor expects the 32-bit-offset value to be relative to
+          the start of the *next* instruction.  The patcher will patch
+          the location we specified ("where + 2", but that is 4 bytes
+          before the start of the next instruction.  Hence we set the bias
+          to -4, so that it reduces the computed offset by 4, which makes
+          it relative to the start of the next instruction.
+   */
+   switch (i->tag) {
+      case Ain_JmpCond:  {
+         Relocation rel = { .where    = where + 2,
+                            .bitNoMin = 0,
+                            .bitNoMax = 31,
+                            .bias     = -4,
+                            .rshift   = 0 };
+         return rel;
+      }
+      default:
+         // We don't expect to be asked to create relocation information
+         // for any other kind of instruction.
+         vpanic("collectRelocInfo_AMD64");
+   }
 }
 
 

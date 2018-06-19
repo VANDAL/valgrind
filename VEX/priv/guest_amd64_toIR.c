@@ -198,7 +198,8 @@ static Addr64 guest_RIP_bbstart;
    translated. */
 static Addr64 guest_RIP_curr_instr;
 
-/* The IRSB* into which we're generating code. */
+/* The IRSB* into which we're generating code. All functions below work
+   implicitly with the main statement vector held by irsb->stmts. */
 static IRSB* irsb;
 
 /* For ensuring that %rip-relative addressing is done right.  A read
@@ -221,17 +222,18 @@ static Bool   guest_RIP_next_mustcheck;
 /*--- Helpers for constructing IR.                         ---*/
 /*------------------------------------------------------------*/
  
-/* Generate a new temporary of the given type. */
+/* Generate a new temporary of the given type.
+   Works only for the main IRStmtVec #0. */
 static IRTemp newTemp ( IRType ty )
 {
    vassert(isPlausibleIRType(ty));
-   return newIRTemp( irsb->tyenv, ty );
+   return newIRTemp(irsb->tyenv, irsb->stmts, ty);
 }
 
-/* Add a statement to the list held by "irsb". */
+/* Add a statement to the main statement vector held by "irbb->stmts". */
 static void stmt ( IRStmt* st )
 {
-   addStmtToIRSB( irsb, st );
+   addStmtToIRStmtVec(irsb->stmts, st);
 }
 
 /* Generate a statement "dst := e". */ 
@@ -1857,7 +1859,7 @@ static void setFlags_DEP1_DEP2_shift ( IROp    op64,
       default: vassert(0);
    }
 
-   vassert(guard);
+   vassert(guard != IRTemp_INVALID);
 
    /* Both kinds of right shifts are handled by the same thunk
       operation. */
@@ -32469,13 +32471,13 @@ DisResult disInstr_AMD64 ( IRSB*        irsb_IN,
    guest_RIP_next_assumed   = 0;
    guest_RIP_next_mustcheck = False;
 
-   x1 = irsb_IN->stmts_used;
+   x1 = irsb_IN->stmts->stmts_used;
    expect_CAS = False;
    dres = disInstr_AMD64_WRK ( &expect_CAS, resteerOkFn,
                                resteerCisOk,
                                callback_opaque,
                                delta, archinfo, abiinfo, sigill_diag_IN );
-   x2 = irsb_IN->stmts_used;
+   x2 = irsb_IN->stmts->stmts_used;
    vassert(x2 >= x1);
 
    /* If disInstr_AMD64_WRK tried to figure out the next rip, check it
@@ -32496,7 +32498,7 @@ DisResult disInstr_AMD64 ( IRSB*        irsb_IN,
       IRCAS as directed by the returned expect_CAS value. */
    has_CAS = False;
    for (i = x1; i < x2; i++) {
-      if (irsb_IN->stmts[i]->tag == Ist_CAS)
+      if (irsb_IN->stmts->stmts[i]->tag == Ist_CAS)
          has_CAS = True;
    }
 
@@ -32510,7 +32512,7 @@ DisResult disInstr_AMD64 ( IRSB*        irsb_IN,
                                   delta, archinfo, abiinfo, sigill_diag_IN );
       for (i = x1; i < x2; i++) {
          vex_printf("\t\t");
-         ppIRStmt(irsb_IN->stmts[i]);
+         ppIRStmt(irsb_IN->stmts->stmts[i], irsb_IN->tyenv, 4);
          vex_printf("\n");
       }
       /* Failure of this assertion is serious and denotes a bug in

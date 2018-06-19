@@ -361,6 +361,8 @@ typedef
       Ain_Div,         /* div and mod */
       Ain_Push,        /* push 64-bit value on stack */
       Ain_Call,        /* call to address in register */
+      Ain_Jmp,         /* unconditional branch */
+      Ain_JmpCond,     /* conditional branch */
       Ain_XDirect,     /* direct transfer to GA */
       Ain_XIndir,      /* indirect transfer to GA */
       Ain_XAssisted,   /* assisted transfer to GA */
@@ -403,7 +405,8 @@ typedef
       //uu                     no alignment constraints */
       //uu Ain_AvxReRg,     /* AVX binary general reg-reg, Re, Rg */
       Ain_EvCheck,     /* Event check */
-      Ain_ProfInc      /* 64-bit profile counter increment */
+      Ain_ProfInc,     /* 64-bit profile counter increment */
+      Ain_IfThenElse   /* HInstrIfThenElse */
    }
    AMD64InstrTag;
 
@@ -476,6 +479,22 @@ typedef
             Int           regparms; /* 0 .. 6 */
             RetLoc        rloc;     /* where the return value will be */
          } Call;
+         /* Unconditional branch, using the offset (dstOffs - hereOffs).
+            This could be done with just one offset, but storing two values
+            makes it easier to understand assembly debug printing. */
+         struct {
+			// TODO Addr64?
+            UInt hereOffs;
+            UInt dstOffs;
+         } Jmp;
+         /* Conditional branch.  At the time this is generated, we don't
+            know the offset and so this merely denotes a conditional branch
+            with a 32-bit unknown offset.  For debug printing ONLY, we also
+            record the assembler queue entry number. */
+         struct {
+            AMD64CondCode cond;
+            UInt          dst_qentno; // FOR DEBUG PRINTING ONLY
+         } JmpCond;
          /* Update the guest RIP value, then exit requesting to chain
             to it.  May be conditional. */
          struct {
@@ -713,6 +732,9 @@ typedef
                installed later, post-translation, by patching it in,
                as it is not known at translation time. */
          } ProfInc;
+         struct {
+            HInstrIfThenElse* hite;
+         } IfThenElse;
 
       } Ain;
    }
@@ -730,6 +752,9 @@ extern AMD64Instr* AMD64Instr_MulL       ( Bool syned, AMD64RM* );
 extern AMD64Instr* AMD64Instr_Div        ( Bool syned, Int sz, AMD64RM* );
 extern AMD64Instr* AMD64Instr_Push       ( AMD64RMI* );
 extern AMD64Instr* AMD64Instr_Call       ( AMD64CondCode, Addr64, Int, RetLoc );
+extern AMD64Instr* AMD64Instr_Jmp        ( UInt hereOffs, UInt dstOffs );
+extern AMD64Instr* AMD64Instr_JmpCond    ( AMD64CondCode,
+                                           UInt/*FOR DEBUG PRINTING ONLY*/);
 extern AMD64Instr* AMD64Instr_XDirect    ( Addr64 dstGA, AMD64AMode* amRIP,
                                            AMD64CondCode cond, Bool toFastEP );
 extern AMD64Instr* AMD64Instr_XIndir     ( HReg dstGA, AMD64AMode* amRIP,
@@ -777,23 +802,21 @@ extern AMD64Instr* AMD64Instr_SseShuf    ( Int order, HReg src, HReg dst );
 extern AMD64Instr* AMD64Instr_EvCheck    ( AMD64AMode* amCounter,
                                            AMD64AMode* amFailAddr );
 extern AMD64Instr* AMD64Instr_ProfInc    ( void );
+extern AMD64Instr* AMD64Instr_IfThenElse ( HInstrIfThenElse* );
 
 
 extern void ppAMD64Instr ( const AMD64Instr*, Bool );
+extern void ppAMD64CondCode( AMD64CondCode );
 
 /* Some functions that insulate the register allocator from details
    of the underlying instruction set. */
 extern void getRegUsage_AMD64Instr ( HRegUsage*, const AMD64Instr*, Bool );
 extern void mapRegs_AMD64Instr     ( HRegRemap*, AMD64Instr*, Bool );
-extern Int          emit_AMD64Instr   ( /*MB_MOD*/Bool* is_profInc,
-                                        UChar* buf, Int nbuf,
-                                        const AMD64Instr* i, 
-                                        Bool mode64,
-                                        VexEndness endness_host,
-                                        const void* disp_cp_chain_me_to_slowEP,
-                                        const void* disp_cp_chain_me_to_fastEP,
-                                        const void* disp_cp_xindir,
-                                        const void* disp_cp_xassisted );
+extern HInstrIfThenElse* isIfThenElse_AMD64Instr(AMD64Instr*);
+extern UInt         emit_AMD64Instr   ( /*MB_MOD*/Bool* is_profInc,
+                                        UChar* buf, UInt nbuf,
+                                        const AMD64Instr* i,
+                                        const EmitConstants* emitConsts );
 
 extern void genSpill_AMD64  ( /*OUT*/HInstr** i1, /*OUT*/HInstr** i2,
                               HReg rreg, Int offset, Bool );
@@ -838,6 +861,10 @@ extern VexInvalRange patchProfInc_AMD64 ( VexEndness endness_host,
                                           void*  place_to_patch,
                                           const ULong* location_of_counter );
 
+/* Create relocation info needed to patch a branch offset for instruction I
+   whose first instruction is at WHERE in the assembly buffer. */
+extern Relocation createRelocInfo_AMD64 ( AssemblyBufferOffset where,
+                                          const AMD64Instr* i );
 
 #endif /* ndef __VEX_HOST_AMD64_DEFS_H */
 

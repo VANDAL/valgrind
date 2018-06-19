@@ -98,6 +98,19 @@ static Bool isZeroU8 ( IRExpr* e )
           && e->Iex.Const.con->Ico.U8 == 0;
 }
 
+static void print_depth(UInt depth)
+{
+   for (UInt i = 0; i < depth; i++) {
+      vex_printf("    ");
+   }
+}
+
+static void print_IRStmt_prefix(UInt depth)
+{
+   vex_printf("\n");
+   print_depth(depth);
+   vex_printf("-- ");
+}
 
 /*---------------------------------------------------------*/
 /*--- ISelEnv                                           ---*/
@@ -124,7 +137,8 @@ static Bool isZeroU8 ( IRExpr* e )
    - The host subarchitecture we are selecting insns for.  
      This is set at the start and does not change.
 
-   - The code array, that is, the insns selected so far.
+   - The code vector, that is, the insns selected so far. HInstrVec 'code'
+     changes according to the current IRStmtVec being processed.
 
    - A counter, for generating new virtual registers.
 
@@ -147,7 +161,8 @@ static Bool isZeroU8 ( IRExpr* e )
 typedef
    struct {
       /* Constant -- are set at the start and do not change. */
-      IRTypeEnv*   type_env;
+      HInstrSB*        code_sb;
+      const IRTypeEnv* type_env;
 
       HReg*        vregmap;
       HReg*        vregmapHI;
@@ -159,8 +174,9 @@ typedef
       Addr64       max_ga;
 
       /* These are modified as we go along. */
-      HInstrArray* code;
-      Int          vreg_ctr;
+      HInstrVec*   code;
+      UInt         vreg_ctr;
+      UInt         depth;
    }
    ISelEnv;
 
@@ -186,6 +202,7 @@ static void addInstr ( ISelEnv* env, AMD64Instr* instr )
 {
    addHInstr(env->code, instr);
    if (vex_traceflags & VEX_TRACE_VCODE) {
+      print_depth(env->depth);
       ppAMD64Instr(instr, True);
       vex_printf("\n");
    }
@@ -4280,11 +4297,120 @@ static void iselDVecExpr_wrk ( /*OUT*/HReg* rHi, /*OUT*/HReg* rLo,
 /*--- ISEL: Statements                                  ---*/
 /*---------------------------------------------------------*/
 
+static void iselStmt(ISelEnv* env, IRStmt* stmt);
+
+static HPhiNode* convertPhiNodes(ISelEnv* env, const IRPhiVec* phi_nodes,
+                                 IRIfThenElse_Hint hint, UInt *n_phis)
+{
+   *n_phis = phi_nodes->phis_used;
+   HPhiNode* hphis = LibVEX_Alloc_inline(*n_phis * sizeof(HPhiNode));
+
+   for (UInt i = 0; i < *n_phis; i++) {
+      const IRPhi* phi = phi_nodes->phis[i];
+      hphis[i].dst = lookupIRTemp(env, phi->dst);
+
+      switch (hint) {
+      case IfThenElse_ThenLikely:
+         hphis[i].srcFallThrough = lookupIRTemp(env, phi->srcThen);
+         hphis[i].srcOutOfLine   = lookupIRTemp(env, phi->srcElse);
+         break;
+      case IfThenElse_ElseLikely:
+         hphis[i].srcFallThrough = lookupIRTemp(env, phi->srcElse);
+         hphis[i].srcOutOfLine   = lookupIRTemp(env, phi->srcThen);
+         break;
+      default:
+         vassert(0);
+      }
+   }
+   return hphis;
+}
+
+static void iselStmtVec(ISelEnv* env, IRStmtVec* stmts)
+{
+   for (UInt i = 0; i < stmts->stmts_used; i++) {
+      IRStmt* st = stmts->stmts[i];
+      if (st->tag != Ist_IfThenElse) {
+         iselStmt(env, stmts->stmts[i]);
+         continue;
+      }
+
+      /* Deal with IfThenElse. */
+      HInstrVec* current_code = env->code;
+      IRIfThenElse* ite       = st->Ist.IfThenElse.details;
+      if (vex_traceflags & VEX_TRACE_VCODE) {
+         print_IRStmt_prefix(env->depth);
+         ppIRIfThenElseCondHint(ite);
+         vex_printf(" then {\n");
+      }
+
+      UInt n_phis;
+      HPhiNode* phi_nodes = convertPhiNodes(env, ite->phi_nodes,
+                                            ite->hint, &n_phis);
+
+      AMD64CondCode cc = iselCondCode(env, ite->cond);
+      /* cc is the condition code that will be true when we want to execute
+         the |then| branch.  That will be correct if the |then| branch is
+         the out-of-line (unlikely) one.  But if the |else| branch is the
+         OOL one then we need to invert the condition code. */
+      AMD64CondCode ccOOL
+         = (ite->hint == IfThenElse_ThenLikely) ? (cc ^ 1) : cc;
+      /* Note: do not insert any instructions which alter |ccOOL| before it
+         is consumed by the corresponding branch. */
+      HInstrIfThenElse* hite = newHInstrIfThenElse(ccOOL, phi_nodes, n_phis);
+      AMD64Instr* instr      = AMD64Instr_IfThenElse(hite);
+      addInstr(env, instr);
+
+      env->depth += 1;
+
+      IRStmtVec* likely_leg;
+      IRStmtVec* unlikely_leg;
+      switch (ite->hint) {
+      case IfThenElse_ThenLikely:
+         likely_leg   = ite->then_leg;
+         unlikely_leg = ite->else_leg;
+         break;
+      case IfThenElse_ElseLikely:
+         likely_leg   = ite->else_leg;
+         unlikely_leg = ite->then_leg;
+         break;
+      default:
+          vassert(0);
+      }
+
+      env->code = hite->fallThrough;
+      iselStmtVec(env, likely_leg);
+      if (vex_traceflags & VEX_TRACE_VCODE) {
+         print_IRStmt_prefix(env->depth - 1);
+         vex_printf("} else OOL {\n");
+      }
+      env->code = hite->outOfLine;
+      iselStmtVec(env, unlikely_leg);
+
+      env->depth -= 1;
+      env->code = current_code;
+
+      if (vex_traceflags & VEX_TRACE_VCODE) {
+         print_IRStmt_prefix(env->depth);
+         vex_printf("}\n");
+
+         for (UInt j = 0; j < hite->n_phis; j++) {
+            print_IRStmt_prefix(env->depth);
+            ppIRPhi(ite->phi_nodes->phis[j]);
+            vex_printf("\n");
+
+            print_depth(env->depth);
+            ppHPhiNode(&hite->phi_nodes[j]);
+            vex_printf("\n");
+         }
+      }
+   }
+}
+
 static void iselStmt ( ISelEnv* env, IRStmt* stmt )
 {
    if (vex_traceflags & VEX_TRACE_VCODE) {
-      vex_printf("\n-- ");
-      ppIRStmt(stmt);
+      print_IRStmt_prefix(env->depth);
+      ppIRStmt(stmt, env->type_env, 0);
       vex_printf("\n");
    }
 
@@ -4816,7 +4942,7 @@ static void iselStmt ( ISelEnv* env, IRStmt* stmt )
    default: break;
    }
   stmt_fail:
-   ppIRStmt(stmt);
+   ppIRStmt(stmt, env->type_env, 0);
    vpanic("iselStmt(amd64)");
 }
 
@@ -4920,7 +5046,7 @@ static void iselNext ( ISelEnv* env,
 
 /* Translate an entire SB to amd64 code. */
 
-HInstrArray* iselSB_AMD64 ( const IRSB* bb,
+HInstrSB* iselSB_AMD64    ( const IRSB* bb,
                             VexArch      arch_host,
                             const VexArchInfo* archinfo_host,
                             const VexAbiInfo*  vbi/*UNUSED*/,
@@ -4930,9 +5056,6 @@ HInstrArray* iselSB_AMD64 ( const IRSB* bb,
                             Bool addProfInc,
                             Addr max_ga )
 {
-   Int        i, j;
-   HReg       hreg, hregHI;
-   ISelEnv*   env;
    UInt       hwcaps_host = archinfo_host->hwcaps;
    AMD64AMode *amCounter, *amFailAddr;
 
@@ -4951,18 +5074,20 @@ HInstrArray* iselSB_AMD64 ( const IRSB* bb,
    vassert(archinfo_host->endness == VexEndnessLE);
 
    /* Make up an initial environment to use. */
-   env = LibVEX_Alloc_inline(sizeof(ISelEnv));
+   ISelEnv* env = LibVEX_Alloc_inline(sizeof(ISelEnv));
    env->vreg_ctr = 0;
 
-   /* Set up output code array. */
-   env->code = newHInstrArray();
+   /* Set up output HInstrSB and the first processed HInstrVec. */
+   env->code_sb = newHInstrSB();
+   env->code    = env->code_sb->insns;
+   env->depth   = 0;
 
    /* Copy BB's type env. */
    env->type_env = bb->tyenv;
 
    /* Make up an IRTemp -> virtual HReg mapping.  This doesn't
       change as we go along. */
-   env->n_vregmap = bb->tyenv->types_used;
+   env->n_vregmap = bb->tyenv->used;
    env->vregmap   = LibVEX_Alloc_inline(env->n_vregmap * sizeof(HReg));
    env->vregmapHI = LibVEX_Alloc_inline(env->n_vregmap * sizeof(HReg));
 
@@ -4973,9 +5098,10 @@ HInstrArray* iselSB_AMD64 ( const IRSB* bb,
 
    /* For each IR temporary, allocate a suitably-kinded virtual
       register. */
-   j = 0;
-   for (i = 0; i < env->n_vregmap; i++) {
-      hregHI = hreg = INVALID_HREG;
+   UInt j = 0;
+   for (UInt i = 0; i < env->n_vregmap; i++) {
+      HReg hreg   = INVALID_HREG;
+      HReg hregHI = INVALID_HREG;
       switch (bb->tyenv->types[i]) {
          case Ity_I1:
          case Ity_I8: case Ity_I16: case Ity_I32: case Ity_I64:
@@ -5017,15 +5143,13 @@ HInstrArray* iselSB_AMD64 ( const IRSB* bb,
    }
 
    /* Ok, finally we can iterate over the statements. */
-   for (i = 0; i < bb->stmts_used; i++)
-      if (bb->stmts[i])
-         iselStmt(env, bb->stmts[i]);
+   iselStmtVec(env, bb->stmts);
 
    iselNext(env, bb->next, bb->jumpkind, bb->offsIP);
 
    /* record the number of vregs we used. */
-   env->code->n_vregs = env->vreg_ctr;
-   return env->code;
+   env->code_sb->n_vregs = env->vreg_ctr;
+   return env->code_sb;
 }
 
 

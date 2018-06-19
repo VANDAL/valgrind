@@ -1442,24 +1442,33 @@ static void libvex_BackEnd ( const VexTranslateArgs* vta,
                               X86FN(createRelocInfo_X86);
          vassert(vta->archinfo_host.endness == VexEndnessLE);
          break;
-#if 0
       case VexArchAMD64:
          mode64       = True;
          rRegUniv     = AMD64FN(getRRegUniverse_AMD64());
          getRegUsage  
             = CAST_TO_TYPEOF(getRegUsage) AMD64FN(getRegUsage_AMD64Instr);
          mapRegs      = CAST_TO_TYPEOF(mapRegs) AMD64FN(mapRegs_AMD64Instr);
+         isIfThenElse = CAST_TO_TYPEOF(isIfThenElse) AMD64FN(isIfThenElse_AMD64Instr);
          genSpill     = CAST_TO_TYPEOF(genSpill) AMD64FN(genSpill_AMD64);
          genReload    = CAST_TO_TYPEOF(genReload) AMD64FN(genReload_AMD64);
          genMove      = CAST_TO_TYPEOF(genMove) AMD64FN(genMove_AMD64);
+         genHInstrITE = CAST_TO_TYPEOF(genHInstrITE) AMD64FN(AMD64Instr_IfThenElse);
          directReload = CAST_TO_TYPEOF(directReload) AMD64FN(directReload_AMD64);
          ppInstr      = CAST_TO_TYPEOF(ppInstr) AMD64FN(ppAMD64Instr);
+         ppCondCode   = CAST_TO_TYPEOF(ppCondCode) AMD64FN(ppAMD64CondCode);
          ppReg        = CAST_TO_TYPEOF(ppReg) AMD64FN(ppHRegAMD64);
          iselSB       = AMD64FN(iselSB_AMD64);
          emitInstr    = CAST_TO_TYPEOF(emitInstr) AMD64FN(emit_AMD64Instr);
+         HInstr_Jmp      = CAST_TO_TYPEOF(HInstr_Jmp)
+                              AMD64FN(AMD64Instr_Jmp);
+         HInstr_JmpCond  = CAST_TO_TYPEOF(HInstr_JmpCond)
+                              AMD64FN(AMD64Instr_JmpCond);
+         createRelocInfo = CAST_TO_TYPEOF(createRelocInfo)
+                              AMD64FN(createRelocInfo_AMD64);
          vassert(vta->archinfo_host.endness == VexEndnessLE);
          break;
 
+#if 0
       case VexArchPPC32:
          mode64       = False;
          rRegUniv     = PPC32FN(getRRegUniverse_PPC(mode64));
